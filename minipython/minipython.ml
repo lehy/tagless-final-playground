@@ -1,14 +1,3 @@
-
-
-let test_string = {|
-                   def f(x):
-                   return x + 1
-
-                   y = f(42)
-
-                   print(y)
-                   |};;
-
 module type S = sig
   type module_
   type expression
@@ -161,3 +150,76 @@ let test2 (type module_) (module B : S with type module_ = module_) =
 let _ = Interpret.eval (test1 (module Interpret));;
 let _ = Interpret.eval (test2 (module Interpret));;
 (*  TODO: implement builtin print()  *)
+
+#require "angstrom"
+
+module Parse = struct
+  open Angstrom
+
+  let parse (type t) s (module B : S with type module_ = t) =
+    let space = choice [char ' '; char '\t'] in
+    let spaces = skip_many space in
+    let spaces_count = many space >>| List.length in
+    let spaces1 = skip_many1 space in
+    let spaces_exact n = count n space in
+    let parse_ident =
+      take_while1 (function '_' | 'a' .. 'z' | 'A' .. 'Z' -> true | _ -> false) >>= fun first ->
+      take_while (function '_' | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' -> true | _ -> false) >>| fun second ->
+      first ^ second
+    in
+    let parse_ident_list indent =
+      (*  TODO: allow line returns with appropriate indentation  *)
+      sep_by (spaces *> char ',' *> spaces) parse_ident
+    in
+    let rec parse_def base_indent : B.expression Angstrom.t =
+      string "def" *> spaces1 *> parse_ident >>= fun function_name ->
+      char '(' *> parse_ident_list base_indent <* char ')' >>= fun params ->
+      spaces *> char ':' *> spaces *> choice [
+        (parse_expr base_indent >>| fun x -> [x]);
+        many1 end_of_line *> spaces_count >>= fun indent ->
+        if indent <= base_indent then fail (Printf.sprintf "expected indentation of at least %d" (base_indent+1))
+        else begin
+          parse_expr indent >>= fun first_expr ->
+          many (spaces_exact indent *> parse_expr indent) >>| fun rest_exprs ->
+          first_expr::rest_exprs
+        end
+      ] >>| fun body -> B.assign function_name (B.function_ params body)
+    and parse_assign indent =
+      parse_ident <* spaces <* char '=' <* spaces >>= fun lident -> parse_expr indent >>| B.assign lident
+    and parse_callable_expr indent =
+      choice [
+        parse_ident >>| B.variable;
+        char '(' *> spaces *> parse_expr indent <* spaces <* char ')'
+      ]
+    and parse_call indent =
+      parse_callable_expr indent <* spaces <* char '(' >>= fun func ->
+      parse_expr_list indent <* char ')' >>| B.apply func
+    and parse_expr_list indent =
+      sep_by (spaces *> char ',' *> spaces) (parse_expr indent)
+    and parse_expr indent : B.expression Angstrom.t =
+      choice ~failure_msg:(Printf.sprintf "expected expression indented with %d spaces" indent) [
+        parse_def indent;
+        parse_assign indent;
+        parse_call indent
+      ]
+    in
+    let parse_module =
+      many (parse_expr 0) <* end_of_input >>| B.module_ ""
+    in
+    parse_string parse_module s
+end
+
+let test_string = {|
+def f(x):
+  return x + 1
+
+y = f(42)
+
+print(y)
+|}
+
+let result_map f x = match x with
+  | Error e -> Error e
+  | Ok res -> Ok (f res)
+
+let _ = result_map Interpret.eval (Parse.parse test_string (module Interpret))
